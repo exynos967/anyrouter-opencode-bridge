@@ -158,6 +158,49 @@ async def stream_response(resp):
     except Exception as e:
         print(f"[PROXY] Stream error: {e}")
 
+def sanitize_messages(messages):
+    if not isinstance(messages, list):
+        return messages, 0
+    changed = 0
+    sanitized = []
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            sanitized.append(msg)
+            continue
+        content = msg.get("content")
+        msg_changed = False
+        if isinstance(content, str):
+            stripped = content.rstrip()
+            if stripped != content:
+                content = stripped
+                msg_changed = True
+        elif isinstance(content, list):
+            blocks = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+                    stripped_text = block["text"].rstrip()
+                    if stripped_text != block["text"]:
+                        block = {**block, "text": stripped_text}
+                        msg_changed = True
+                blocks.append(block)
+            while blocks:
+                tail = blocks[-1]
+                if not (isinstance(tail, dict) and tail.get("type") == "text" and tail.get("text") == ""):
+                    break
+                blocks.pop()
+                msg_changed = True
+            content = blocks
+        if msg_changed:
+            msg = {**msg, "content": content}
+            changed += 1
+        sanitized.append(msg)
+    if sanitized and isinstance(sanitized[-1], dict) and sanitized[-1].get("role") == "assistant":
+        last_content = sanitized[-1].get("content")
+        if (isinstance(last_content, str) and last_content == "") or (isinstance(last_content, list) and len(last_content) == 0):
+            sanitized.pop()
+            changed += 1
+    return sanitized, changed
+
 @app.get("/config")
 async def get_config():
     safe_config = config.copy()
@@ -200,6 +243,10 @@ async def proxy(path: str, request: Request):
                 print(f"[PROXY] Has tools: {'tools' in body_json}, tools count: {len(body_json.get('tools', []))}")
                 print(f"[PROXY] Has system: {'system' in body_json}")
                 print(f"[PROXY] Has thinking: {'thinking' in body_json}")
+            if 'messages' in filtered_body:
+                filtered_body['messages'], sanitize_changed = sanitize_messages(filtered_body.get('messages'))
+                if config['debug'] and sanitize_changed:
+                    print(f"[PROXY] Sanitized assistant messages: {sanitize_changed}")
             if ('sonnet' in model.lower() or 'opus' in model.lower() or 'haiku' in model.lower()) and CLAUDE_CODE_TOOLS:
                 filtered_body['tools'] = CLAUDE_CODE_TOOLS
                 if config['debug']:
