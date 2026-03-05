@@ -39,7 +39,7 @@ def load_claude_code_templates():
         try:
             with open(system_file, 'r', encoding='utf-8') as f:
                 CLAUDE_CODE_SYSTEM = json.load(f)
-            print(f"[SYSTEM] Loaded Claude Code system prompt")
+            print("[SYSTEM] Loaded Claude Code system prompt")
         except Exception as e:
             print(f"[SYSTEM] Error loading system: {e}")
 
@@ -158,6 +158,119 @@ async def stream_response(resp):
     except Exception as e:
         print(f"[PROXY] Stream error: {e}")
 
+TRAILING_ASSISTANT_INVALID_ENDINGS = ",，"
+
+def _sanitize_text_tail(text, aggressive=False):
+    if not isinstance(text, str):
+        return text
+    sanitized = text.rstrip()
+    if aggressive:
+        sanitized = sanitized.rstrip(TRAILING_ASSISTANT_INVALID_ENDINGS)
+    return sanitized
+
+def _sanitize_assistant_content(content, aggressive=False):
+    changed = False
+    if isinstance(content, str):
+        sanitized = _sanitize_text_tail(content, aggressive=aggressive)
+        changed = sanitized != content
+        return sanitized, changed
+    if isinstance(content, dict):
+        if content.get("type") == "text" and isinstance(content.get("text"), str):
+            sanitized_text = _sanitize_text_tail(content["text"], aggressive=aggressive)
+            changed = sanitized_text != content["text"]
+            if changed:
+                return {**content, "text": sanitized_text}, True
+        return content, False
+    if isinstance(content, list):
+        blocks = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+                sanitized_text = _sanitize_text_tail(block["text"], aggressive=False)
+                if sanitized_text != block["text"]:
+                    block = {**block, "text": sanitized_text}
+                    changed = True
+            blocks.append(block)
+        if aggressive and blocks:
+            for idx in range(len(blocks) - 1, -1, -1):
+                block = blocks[idx]
+                if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+                    sanitized_text = _sanitize_text_tail(block["text"], aggressive=True)
+                    if sanitized_text != block["text"]:
+                        blocks[idx] = {**block, "text": sanitized_text}
+                        changed = True
+                    break
+        while blocks:
+            tail = blocks[-1]
+            if not (isinstance(tail, dict) and tail.get("type") == "text" and tail.get("text") == ""):
+                break
+            blocks.pop()
+            changed = True
+        return blocks, changed
+    return content, False
+
+def sanitize_messages(messages, aggressive=False):
+    if not isinstance(messages, list):
+        return messages, 0
+    changed = 0
+    sanitized = []
+    total = len(messages)
+    for idx, msg in enumerate(messages):
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            sanitized.append(msg)
+            continue
+        content = msg.get("content")
+        is_last_message = idx == (total - 1)
+        content, msg_changed = _sanitize_assistant_content(content, aggressive=aggressive and is_last_message)
+        if msg_changed:
+            msg = {**msg, "content": content}
+            changed += 1
+        sanitized.append(msg)
+    if sanitized and isinstance(sanitized[-1], dict) and sanitized[-1].get("role") == "assistant":
+        last_content = sanitized[-1].get("content")
+        if (isinstance(last_content, str) and last_content == "") or (isinstance(last_content, list) and len(last_content) == 0):
+            sanitized.pop()
+            changed += 1
+    return sanitized, changed
+
+def _to_int(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+def _calculate_thinking_budget(max_tokens):
+    max_tokens_int = _to_int(max_tokens)
+    if max_tokens_int is None:
+        return 1024
+    if max_tokens_int <= 1024:
+        return None
+    budget = max(1024, min(10000, max_tokens_int // 4))
+    if budget >= max_tokens_int:
+        budget = max_tokens_int - 1
+    if budget < 1024:
+        return None
+    return budget
+
+def _normalize_thinking_config(existing_thinking, max_tokens):
+    max_tokens_int = _to_int(max_tokens)
+    if isinstance(existing_thinking, dict):
+        budget = _to_int(existing_thinking.get("budget_tokens"))
+    else:
+        budget = None
+    if budget is None:
+        budget = _calculate_thinking_budget(max_tokens_int)
+    if budget is None:
+        return None
+    if max_tokens_int is not None and budget >= max_tokens_int:
+        if max_tokens_int <= 1024:
+            return None
+        budget = max_tokens_int - 1
+        if budget < 1024:
+            return None
+    return {"type": "enabled", "budget_tokens": budget}
+
 @app.get("/config")
 async def get_config():
     safe_config = config.copy()
@@ -187,6 +300,7 @@ async def proxy(path: str, request: Request):
     body = await request.body()
     body_json = {}
     wants_stream = False
+    removed_sampling_params = {}
     if body:
         try:
             body_json = json.loads(body)
@@ -200,6 +314,10 @@ async def proxy(path: str, request: Request):
                 print(f"[PROXY] Has tools: {'tools' in body_json}, tools count: {len(body_json.get('tools', []))}")
                 print(f"[PROXY] Has system: {'system' in body_json}")
                 print(f"[PROXY] Has thinking: {'thinking' in body_json}")
+            if 'messages' in filtered_body:
+                filtered_body['messages'], sanitize_changed = sanitize_messages(filtered_body.get('messages'))
+                if config['debug'] and sanitize_changed:
+                    print(f"[PROXY] Sanitized assistant messages: {sanitize_changed}")
             if ('sonnet' in model.lower() or 'opus' in model.lower() or 'haiku' in model.lower()) and CLAUDE_CODE_TOOLS:
                 filtered_body['tools'] = CLAUDE_CODE_TOOLS
                 if config['debug']:
@@ -207,12 +325,23 @@ async def proxy(path: str, request: Request):
                 if CLAUDE_CODE_SYSTEM:
                     filtered_body['system'] = CLAUDE_CODE_SYSTEM
                     if config['debug']:
-                        print(f"[PROXY] Injected Claude Code system prompt")
+                        print("[PROXY] Injected Claude Code system prompt")
                 if 'sonnet' in model.lower() or 'opus' in model.lower():
-                    if 'thinking' not in filtered_body:
-                        filtered_body['thinking'] = {"budget_tokens": 10000, "type": "enabled"}
+                    normalized_thinking = _normalize_thinking_config(filtered_body.get('thinking'), filtered_body.get('max_tokens'))
+                    if normalized_thinking:
+                        filtered_body['thinking'] = normalized_thinking
                         if config['debug']:
-                            print(f"[PROXY] Injected thinking config")
+                            print(f"[PROXY] Normalized thinking config: {normalized_thinking}")
+                    elif 'thinking' in filtered_body:
+                        filtered_body.pop('thinking', None)
+                        if config['debug']:
+                            print("[PROXY] Removed invalid thinking config")
+                    if 'thinking' in filtered_body:
+                        for sampling_key in ("temperature", "top_p", "top_k"):
+                            if sampling_key in filtered_body:
+                                removed_sampling_params[sampling_key] = filtered_body.pop(sampling_key)
+                        if config['debug'] and removed_sampling_params:
+                            print(f"[PROXY] Removed sampling params for thinking compatibility: {list(removed_sampling_params.keys())}")
                 filtered_body['metadata'] = {"user_id": "proxy_user"}
             wants_stream = filtered_body.get('stream', False)
             body_json = filtered_body
@@ -234,6 +363,8 @@ async def proxy(path: str, request: Request):
         print(f"[PROXY] Stream: {wants_stream}")
     max_attempts = 5
     retry_delay = 1
+    thinking_compat_retried = False
+    aggressive_sanitize_retried = False
     for attempt in range(max_attempts):
         try:
             if config['debug']:
@@ -257,6 +388,41 @@ async def proxy(path: str, request: Request):
                     if config['debug']:
                         print(f"[PROXY] Error response: {error_content.decode('utf-8', errors='ignore')[:500]}")
                     return Response(content=error_content, status_code=resp.status_code, media_type="application/json")
+                if resp.status_code >= 400:
+                    error_content = await resp.aread()
+                    await resp.aclose()
+                    error_text = error_content.decode('utf-8', errors='ignore')
+                    if config['debug']:
+                        print(f"[PROXY] Error response: {error_text[:500]}")
+                        print(f"[PROXY] Error response body length: {len(error_content)}")
+                    if (
+                        resp.status_code == 400
+                        and 'thinking' in body_json
+                        and not thinking_compat_retried
+                    ):
+                        body_json.pop('thinking', None)
+                        if removed_sampling_params:
+                            for sampling_key, sampling_value in removed_sampling_params.items():
+                                body_json[sampling_key] = sampling_value
+                        thinking_compat_retried = True
+                        if config['debug']:
+                            print("[PROXY] Retrying without thinking for compatibility")
+                        await asyncio.sleep(0.1)
+                        continue
+                    if (
+                        resp.status_code == 400
+                        and "messages: final assistant content cannot end with trailing" in error_text
+                        and not aggressive_sanitize_retried
+                        and isinstance(body_json, dict)
+                        and 'messages' in body_json
+                    ):
+                        body_json['messages'], aggressive_changed = sanitize_messages(body_json.get('messages'), aggressive=True)
+                        aggressive_sanitize_retried = True
+                        if config['debug']:
+                            print(f"[PROXY] Retrying after aggressive assistant-tail sanitize, changed: {aggressive_changed}")
+                        await asyncio.sleep(0.1)
+                        continue
+                    return Response(content=error_content, status_code=resp.status_code, media_type="application/json")
                 return StreamingResponse(stream_response(resp), status_code=resp.status_code, media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
             else:
                 resp = await CLIENT.send(req)
@@ -270,6 +436,40 @@ async def proxy(path: str, request: Request):
                     return Response(content=b'{"error":{"message":"Network error after max retries"}}', status_code=502, media_type="application/json")
                 if resp.status_code in [403, 500]:
                     return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+                if resp.status_code >= 400:
+                    error_content = resp.content
+                    error_text = error_content.decode('utf-8', errors='ignore')
+                    if config['debug']:
+                        print(f"[PROXY] Error response: {error_text[:500]}")
+                        print(f"[PROXY] Error response body length: {len(error_content)}")
+                    if (
+                        resp.status_code == 400
+                        and 'thinking' in body_json
+                        and not thinking_compat_retried
+                    ):
+                        body_json.pop('thinking', None)
+                        if removed_sampling_params:
+                            for sampling_key, sampling_value in removed_sampling_params.items():
+                                body_json[sampling_key] = sampling_value
+                        thinking_compat_retried = True
+                        if config['debug']:
+                            print("[PROXY] Retrying without thinking for compatibility")
+                        await asyncio.sleep(0.1)
+                        continue
+                    if (
+                        resp.status_code == 400
+                        and "messages: final assistant content cannot end with trailing" in error_text
+                        and not aggressive_sanitize_retried
+                        and isinstance(body_json, dict)
+                        and 'messages' in body_json
+                    ):
+                        body_json['messages'], aggressive_changed = sanitize_messages(body_json.get('messages'), aggressive=True)
+                        aggressive_sanitize_retried = True
+                        if config['debug']:
+                            print(f"[PROXY] Retrying after aggressive assistant-tail sanitize, changed: {aggressive_changed}")
+                        await asyncio.sleep(0.1)
+                        continue
+                    return Response(content=error_content, status_code=resp.status_code, media_type="application/json")
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
         except Exception as e:
             if config['debug']:
@@ -300,6 +500,6 @@ if __name__ == '__main__':
         sys.stdout.reconfigure(encoding='utf-8')
     log_level = "info" if config['debug'] else "warning"
     try:
-        uvicorn.run(app, host="127.0.0.1", port=8765, log_level=log_level)
+        uvicorn.run(app, host="0.0.0.0", port=8765, log_level=log_level)
     except KeyboardInterrupt:
         print("\nStopping server...")
